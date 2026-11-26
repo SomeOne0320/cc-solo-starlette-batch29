@@ -5,6 +5,7 @@ import importlib.util
 import os
 import stat
 from email.utils import parsedate
+from mimetypes import guess_type
 from typing import Union
 
 import anyio
@@ -18,6 +19,47 @@ from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
 PathLike = Union[str, "os.PathLike[str]"]
+
+# Precompressed variants supported by `StaticFiles(precompressed=True)`, as
+# `(content encoding, file extension)` pairs, in decreasing order of
+# preference for clients that weight them equally.
+PRECOMPRESSED_VARIANTS = (("br", ".br"), ("gzip", ".gz"))
+
+
+def parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
+    """
+    Parse an "Accept-Encoding" header into a mapping of content coding to
+    quality weight. Entries with an invalid quality weight are ignored.
+    """
+    encodings: dict[str, float] = {}
+    for item in accept_encoding.split(","):
+        coding, _, parameters = item.partition(";")
+        coding = coding.strip().lower()
+        if not coding:
+            continue
+        q_value = 1.0
+        for parameter in parameters.split(";"):
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    q_value = min(max(float(value), 0.0), 1.0)
+                except ValueError:
+                    pass  # Keep the default quality weight.
+                break
+        encodings[coding] = q_value
+    return encodings
+
+
+def identity_is_acceptable(encodings: dict[str, float]) -> bool:
+    """
+    Given the quality weights parsed from an "Accept-Encoding" header, return
+    `True` if the unencoded ("identity") representation is acceptable. It is
+    acceptable by default, unless refused with "identity;q=0", or with "*;q=0"
+    and no more specific "identity" entry.
+    """
+    if "identity" in encodings:
+        return encodings["identity"] > 0
+    return encodings.get("*", 1.0) > 0
 
 
 class NotModifiedResponse(Response):
@@ -46,6 +88,7 @@ class StaticFiles:
         html: bool = False,
         check_dir: bool = True,
         follow_symlink: bool = False,
+        precompressed: bool = False,
     ) -> None:
         self.directory = directory
         self.packages = packages
@@ -53,6 +96,7 @@ class StaticFiles:
         self.html = html
         self.config_checked = False
         self.follow_symlink = follow_symlink
+        self.precompressed = precompressed
         if check_dir and directory is not None and not os.path.isdir(directory):
             raise RuntimeError(f"Directory '{directory}' does not exist")
 
@@ -135,6 +179,8 @@ class StaticFiles:
 
         if stat_result and stat.S_ISREG(stat_result.st_mode):
             # We have a static file to serve.
+            if self.precompressed:
+                return await self.precompressed_file_response(full_path, stat_result, scope)
             return self.file_response(full_path, stat_result, scope)
 
         elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
@@ -148,6 +194,8 @@ class StaticFiles:
                     url = URL(scope=scope)
                     url = url.replace(path=url.path + "/")
                     return RedirectResponse(url=url)
+                if self.precompressed:
+                    return await self.precompressed_file_response(full_path, stat_result, scope)
                 return self.file_response(full_path, stat_result, scope)
 
         if self.html:
@@ -178,16 +226,98 @@ class StaticFiles:
                 continue
         return "", None
 
+    def lookup_precompressed_variant(
+        self, full_path: str, encodings: dict[str, float]
+    ) -> tuple[str, str, os.stat_result] | None:
+        """
+        Given the path of a static file and the quality weights parsed from the
+        "Accept-Encoding" header, return the `(encoding, path, stat_result)` of
+        the most preferred precompressed variant that exists next to it, or
+        `None` if the client accepts none of the available variants.
+        """
+        wildcard_q_value = encodings.get("*", 0.0)
+        best: tuple[float, str, str, os.stat_result] | None = None
+        # Variants are listed in decreasing order of preference, so the first
+        # one seen wins when quality weights are equal.
+        for encoding, extension in PRECOMPRESSED_VARIANTS:
+            q_value = encodings.get(encoding, wildcard_q_value)
+            if q_value <= 0:
+                # The client does not accept this encoding.
+                continue
+            variant_path = full_path + extension
+            try:
+                variant_stat = os.stat(variant_path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(variant_stat.st_mode):
+                continue
+            if not self.follow_symlink:
+                # Don't allow a symlinked variant to break out of the directory
+                # containing the original file.
+                directory = os.path.dirname(full_path)
+                if os.path.commonpath([os.path.realpath(variant_path), directory]) != directory:
+                    continue
+            if best is None or q_value > best[0]:
+                best = (q_value, encoding, variant_path, variant_stat)
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
+
+    async def precompressed_file_response(
+        self,
+        full_path: str,
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        """
+        Serve a static file, negotiating a precompressed variant ("<file>.br"
+        or "<file>.gz") when the client advertises support for the encoding in
+        its "Accept-Encoding" header.
+        """
+        encoding: str | None = None
+        media_type: str | None = None
+        request_headers = Headers(scope=scope)
+        accept_encoding = request_headers.get("accept-encoding")
+        if accept_encoding is not None:
+            encodings = parse_accept_encoding(accept_encoding)
+            variant = await anyio.to_thread.run_sync(self.lookup_precompressed_variant, full_path, encodings)
+            if variant is None:
+                # There is no precompressed variant the client accepts. Fall
+                # back to the original file, unless the client refuses it.
+                if not identity_is_acceptable(encodings):
+                    raise HTTPException(status_code=406, headers={"Vary": "Accept-Encoding"})
+            else:
+                encoding, variant_path, variant_stat = variant
+                # The media type is derived from the original file. The
+                # precompressed file is just another representation of it.
+                media_type = guess_type(full_path)[0]
+                full_path, stat_result = variant_path, variant_stat
+        return self.file_response(full_path, stat_result, scope, status_code, encoding, media_type)
+
     def file_response(
         self,
         full_path: PathLike,
         stat_result: os.stat_result,
         scope: Scope,
         status_code: int = 200,
+        encoding: str | None = None,
+        media_type: str | None = None,
     ) -> Response:
         request_headers = Headers(scope=scope)
 
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result, media_type=media_type)
+        if self.precompressed:
+            # The selected representation depends on the "Accept-Encoding"
+            # header, so caches need to store each of them separately.
+            response.headers.add_vary_header("Accept-Encoding")
+        if encoding is not None:
+            response.headers["content-encoding"] = encoding
+            # Each representation gets its own ETag, so that a "304 Not
+            # Modified" is only returned when the client already holds the
+            # representation that was selected for this request.
+            etag = response.headers["etag"]
+            response.headers["etag"] = f'{etag[:-1]}-{encoding}"'
         if self.is_not_modified(response.headers, request_headers):
             return NotModifiedResponse(response.headers)
         return response
