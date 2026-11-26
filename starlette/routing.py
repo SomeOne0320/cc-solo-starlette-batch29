@@ -7,11 +7,11 @@ import re
 import traceback
 import types
 import warnings
-from collections.abc import Awaitable, Callable, Collection, Generator, Sequence
+from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager
 from enum import Enum
 from re import Pattern
-from typing import Any, TypeVar
+from typing import Any, SupportsIndex, TypeVar, overload
 
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable, parse_host_header
@@ -42,6 +42,11 @@ class Match(Enum):
     NONE = 0
     PARTIAL = 1
     FULL = 2
+
+
+# Incremented when a named route changes its reverse-lookup name. Reverse
+# indexes use this to notice in-place attribute changes without probing routes.
+_route_generation = 0
 
 
 def request_response(
@@ -174,6 +179,12 @@ def compile_path(
 
 
 class BaseRoute:
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "name":
+            global _route_generation
+            _route_generation += 1
+        super().__setattr__(name, value)
+
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         raise NotImplementedError()  # pragma: no cover
 
@@ -452,12 +463,9 @@ class Mount(BaseRoute):
             path_prefix, remaining_params = replace_params(self.path_format, self.param_convertors, path_params)
             if path_kwarg is not None:
                 remaining_params["path"] = path_kwarg
-            for route in self.routes or []:
-                try:
-                    url = route.url_path_for(remaining_name, **remaining_params)
-                    return URLPath(path=path_prefix.rstrip("/") + str(url), protocol=url.protocol)
-                except NoMatchFound:
-                    pass
+            url = _find_reverse_url_path(self.routes, remaining_name, remaining_params)
+            if url is not None:
+                return URLPath(path=path_prefix.rstrip("/") + str(url), protocol=url.protocol)
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -518,12 +526,9 @@ class Host(BaseRoute):
                 # 'name' matches "<mount_name>:<child_name>".
                 remaining_name = name[len(self.name) + 1 :]
             host, remaining_params = replace_params(self.host_format, self.param_convertors, path_params)
-            for route in self.routes or []:
-                try:
-                    url = route.url_path_for(remaining_name, **remaining_params)
-                    return URLPath(path=str(url), protocol=url.protocol, host=host)
-                except NoMatchFound:
-                    pass
+            url = _find_reverse_url_path(self.routes, remaining_name, remaining_params)
+            if url is not None:
+                return URLPath(path=str(url), protocol=url.protocol, host=host)
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -536,6 +541,160 @@ class Host(BaseRoute):
         class_name = self.__class__.__name__
         name = self.name or ""
         return f"{class_name}(host={self.host!r}, name={name!r}, app={self.app!r})"
+
+
+class _RouteList(list[BaseRoute]):
+    """A route list that invalidates its reverse index on every mutation."""
+
+    __slots__ = ("_reverse_index",)
+
+    def __init__(self, routes: Iterable[BaseRoute] = ()) -> None:
+        super().__init__(routes)
+        self._reverse_index: _ReverseIndex | None = None
+
+    def _invalidate_reverse_index(self) -> None:
+        self._reverse_index = None
+
+    def append(self, route: BaseRoute) -> None:
+        super().append(route)
+        self._invalidate_reverse_index()
+
+    def extend(self, routes: Iterable[BaseRoute]) -> None:
+        super().extend(routes)
+        self._invalidate_reverse_index()
+
+    def insert(self, index: SupportsIndex, route: BaseRoute) -> None:
+        super().insert(index, route)
+        self._invalidate_reverse_index()
+
+    def remove(self, route: BaseRoute) -> None:
+        super().remove(route)
+        self._invalidate_reverse_index()
+
+    def pop(self, index: SupportsIndex = -1) -> BaseRoute:
+        route = super().pop(index)
+        self._invalidate_reverse_index()
+        return route
+
+    def clear(self) -> None:
+        super().clear()
+        self._invalidate_reverse_index()
+
+    def reverse(self) -> None:
+        super().reverse()
+        self._invalidate_reverse_index()
+
+    def sort(self, *, key: Callable[[BaseRoute], Any] | None = None, reverse: bool = False) -> None:
+        super().sort(key=key, reverse=reverse)
+        self._invalidate_reverse_index()
+
+    @overload
+    def __setitem__(self, key: SupportsIndex, value: BaseRoute) -> None: ...
+
+    @overload
+    def __setitem__(self, key: slice, value: Iterable[BaseRoute]) -> None: ...
+
+    def __setitem__(self, key: SupportsIndex | slice, value: BaseRoute | Iterable[BaseRoute]) -> None:
+        super().__setitem__(key, value)  # type: ignore[assignment, index]
+        self._invalidate_reverse_index()
+
+    def __delitem__(self, key: SupportsIndex | slice) -> None:
+        super().__delitem__(key)
+        self._invalidate_reverse_index()
+
+    def __iadd__(self, routes: Iterable[BaseRoute]) -> _RouteList:  # type: ignore[override, misc]
+        super().__iadd__(routes)
+        self._invalidate_reverse_index()
+        return self
+
+    def __imul__(self, count: SupportsIndex) -> _RouteList:
+        super().__imul__(count)
+        self._invalidate_reverse_index()
+        return self
+
+
+class _ReverseIndex:
+    """Positions of routes that can take part in reverse URL resolution."""
+
+    __slots__ = ("containers", "dynamic", "exact", "generation")
+
+    def __init__(self, routes: Sequence[BaseRoute]) -> None:
+        self.exact: dict[str, list[int]] = {}
+        self.containers: dict[str, list[int]] = {}
+        self.dynamic: list[int] = []
+        self.generation = _route_generation
+
+        for position, route in enumerate(routes):
+            owner = _url_path_for_owner(route)
+            name = getattr(route, "name", None)
+
+            if owner in (Route, WebSocketRoute) and isinstance(name, str):
+                self.exact.setdefault(name, []).append(position)
+            elif owner in (Mount, Host) and isinstance(name, str):
+                self.containers.setdefault(name, []).append(position)
+            else:
+                # Unnamed mounts/hosts and custom implementations may answer
+                # for names that are not available from ``route.name``.
+                self.dynamic.append(position)
+
+
+def _url_path_for_owner(route: BaseRoute) -> type[Any] | None:
+    route_dict = getattr(route, "__dict__", None)
+    if isinstance(route_dict, dict) and "url_path_for" in route_dict:
+        # An instance-level callable can implement arbitrary name matching.
+        return None
+
+    for klass in type(route).__mro__:
+        if "url_path_for" in klass.__dict__:
+            return klass
+    return None
+
+
+def _get_reverse_index(routes: Sequence[BaseRoute]) -> _ReverseIndex:
+    if isinstance(routes, _RouteList):
+        index = routes._reverse_index
+        if index is not None and index.generation == _route_generation:
+            return index
+
+        index = _ReverseIndex(routes)
+        routes._reverse_index = index
+        return index
+
+    # Public callers can still pass or expose a plain list. It remains correct,
+    # but cannot notify us of in-place mutations, so do not retain its index.
+    return _ReverseIndex(routes)
+
+
+def _reverse_candidate_positions(index: _ReverseIndex, name: str) -> list[int]:
+    positions = list(index.exact.get(name, ()))
+
+    # A named container handles its own name (with ``path``) and names prefixed
+    # by one or more colon-separated name segments.
+    parts = name.split(":")
+    for end in range(1, len(parts) + 1):
+        container_name = ":".join(parts[:end])
+        positions.extend(index.containers.get(container_name, ()))
+
+    positions.extend(index.dynamic)
+
+    # Each route belongs to exactly one index category. Sorting the selected
+    # positions restores the current route-table order between categories.
+    return sorted(positions)
+
+
+def _find_reverse_url_path(
+    routes: Sequence[BaseRoute],
+    name: str,
+    path_params: dict[str, Any],
+) -> URLPath | None:
+    index = _get_reverse_index(routes)
+    for position in _reverse_candidate_positions(index, name):
+        route = routes[position]
+        try:
+            return route.url_path_for(name, **path_params)
+        except NoMatchFound:
+            pass
+    return None
 
 
 _T = TypeVar("_T")
@@ -596,7 +755,7 @@ class Router:
         middleware: Sequence[Middleware] | None = None,
         max_body_size: int | None = None,
     ) -> None:
-        self.routes = [] if routes is None else list(routes)
+        self.routes = _RouteList() if routes is None else _RouteList(routes)
         self.redirect_slashes = redirect_slashes
         self.default = self.not_found if default is None else default
 
@@ -626,6 +785,10 @@ class Router:
         if max_body_size is not None:
             self.middleware_stack = RequestBodyLimitMiddleware(self.middleware_stack, max_body_size=max_body_size)
 
+        # Route tables are normally complete by the time the router is built.
+        # Mutations invalidate this index and rebuild it on the next lookup.
+        _get_reverse_index(self.routes)
+
     async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
             websocket_close = WebSocketClose()
@@ -641,13 +804,22 @@ class Router:
             response = PlainTextResponse("Not Found", status_code=404)
         await response(scope, receive, send)
 
+    @property
+    def routes(self) -> list[BaseRoute]:
+        return self._routes
+
+    @routes.setter
+    def routes(self, routes: Sequence[BaseRoute] | None) -> None:
+        if isinstance(routes, _RouteList):
+            self._routes = routes
+        else:
+            self._routes = _RouteList() if routes is None else _RouteList(routes)
+
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
-        for route in self.routes:
-            try:
-                return route.url_path_for(name, **path_params)
-            except NoMatchFound:
-                pass
-        raise NoMatchFound(name, path_params)
+        url = _find_reverse_url_path(self.routes, name, path_params)
+        if url is None:
+            raise NoMatchFound(name, path_params)
+        return url
 
     async def lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         """

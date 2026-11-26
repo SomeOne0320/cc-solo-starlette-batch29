@@ -86,6 +86,10 @@ class Starlette:
     def routes(self) -> list[BaseRoute]:
         return self.router.routes
 
+    @routes.setter
+    def routes(self, routes: Sequence[BaseRoute] | None) -> None:
+        self.router.routes = routes
+
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
         return self.router.url_path_for(name, **path_params)
 
