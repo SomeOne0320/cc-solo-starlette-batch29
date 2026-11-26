@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Add `threadpool_capacity` to `Starlette`, giving an application its own thread pool quota for synchronous routes, synchronous streaming responses and synchronous background tasks. Mounted applications inherit the parent quota unless they configure their own; applications without it keep using AnyIO's default thread limiter.
+
 ## 1.10.0 (October 24, 2026)
 
 #### Changed

@@ -11,6 +11,7 @@ import anyio
 import anyio.to_thread
 
 from starlette._utils import get_route_path
+from starlette.concurrency import current_threadpool_limiter
 from starlette.datastructures import URL, Headers
 from starlette.exceptions import HTTPException
 from starlette.responses import FileResponse, RedirectResponse, Response
@@ -120,7 +121,9 @@ class StaticFiles:
             raise HTTPException(status_code=405, headers={"Allow": "GET, HEAD"})
 
         try:
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+            full_path, stat_result = await anyio.to_thread.run_sync(
+                self.lookup_path, path, limiter=current_threadpool_limiter()
+            )
         except PermissionError:
             raise HTTPException(status_code=401)
         except OSError as exc:
@@ -141,7 +144,9 @@ class StaticFiles:
             # We're in HTML mode, and have got a directory URL.
             # Check if we have 'index.html' file to serve.
             index_path = os.path.join(path, "index.html")
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, index_path)
+            full_path, stat_result = await anyio.to_thread.run_sync(
+                self.lookup_path, index_path, limiter=current_threadpool_limiter()
+            )
             if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
                 if not scope["path"].endswith("/"):
                     # Directory URLs should redirect to always end in "/".
@@ -152,7 +157,9 @@ class StaticFiles:
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
+            full_path, stat_result = await anyio.to_thread.run_sync(
+                self.lookup_path, "404.html", limiter=current_threadpool_limiter()
+            )
             if stat_result and stat.S_ISREG(stat_result.st_mode):
                 return FileResponse(full_path, stat_result=stat_result, status_code=404)
         raise HTTPException(status_code=404)

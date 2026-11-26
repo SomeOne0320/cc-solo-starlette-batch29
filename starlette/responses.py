@@ -21,7 +21,7 @@ import anyio.to_thread
 
 from starlette._utils import create_collapsing_task_group
 from starlette.background import BackgroundTask
-from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import current_threadpool_limiter, iterate_in_threadpool
 from starlette.datastructures import URL, Headers, MutableHeaders
 from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
@@ -354,7 +354,7 @@ class FileResponse(Response):
 
         if self.stat_result is None:
             try:
-                stat_result = await anyio.to_thread.run_sync(os.stat, self.path)
+                stat_result = await anyio.to_thread.run_sync(os.stat, self.path, limiter=current_threadpool_limiter())
                 self.set_stat_headers(stat_result)
             except FileNotFoundError:
                 raise RuntimeError(f"File at path {self.path} does not exist.")

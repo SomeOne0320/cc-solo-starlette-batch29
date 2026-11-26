@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, ParamSpec, TypeVar
 
+from anyio import CapacityLimiter
+
+from starlette.concurrency import use_threadpool_limiter
 from starlette.datastructures import State, URLPath
 from starlette.middleware import Middleware, _MiddlewareFactory
 from starlette.middleware.body_limit import RequestBodyLimitMiddleware
@@ -29,6 +32,7 @@ class Starlette:
         lifespan: Lifespan[AppType] | None = None,
         *,
         max_body_size: int | None = None,
+        threadpool_capacity: int | None = None,
     ) -> None:
         """Initializes the application.
 
@@ -51,11 +55,21 @@ class Starlette:
                 `on_startup` and `on_shutdown` handlers. Use one or the other, not both.
             max_body_size: Non-negative maximum total size in bytes of an HTTP request
                 body. The default, `None`, does not limit request body size.
+            threadpool_capacity: Maximum number of synchronous operations that this
+                application may run in the thread pool at the same time. The default,
+                `None`, keeps AnyIO's default thread limiter and shares its capacity
+                with every other application. Synchronous routes, responses streamed
+                from synchronous iterators and synchronous background tasks all count
+                against this capacity. A mounted application without its own value
+                inherits the limiter of the application that mounts it.
         """
         self.debug = debug
         self.state = State()
         self.router = Router(routes, lifespan=lifespan)
         self.max_body_size = max_body_size
+        if threadpool_capacity is not None and threadpool_capacity < 1:
+            raise ValueError("threadpool_capacity must be a positive integer")
+        self.threadpool_limiter = None if threadpool_capacity is None else CapacityLimiter(threadpool_capacity)
         self.exception_handlers = {} if exception_handlers is None else dict(exception_handlers)
         self.user_middleware = [] if middleware is None else list(middleware)
         self.middleware_stack: ASGIApp | None = None
@@ -93,7 +107,14 @@ class Starlette:
         scope["app"] = self
         if self.middleware_stack is None:
             self.middleware_stack = self.build_middleware_stack()
-        await self.middleware_stack(scope, receive, send)
+        # Lifespan handling does not offload request work to the thread pool,
+        # and mounted applications only reach this point through HTTP/websocket
+        # scopes, so the limiter only needs to be bound there.
+        if self.threadpool_limiter is not None and scope["type"] in ("http", "websocket"):
+            with use_threadpool_limiter(self.threadpool_limiter):
+                await self.middleware_stack(scope, receive, send)
+        else:
+            await self.middleware_stack(scope, receive, send)
 
     def mount(self, path: str, app: ASGIApp, name: str | None = None) -> None:
         self.router.mount(path, app=app, name=name)  # pragma: no cover
